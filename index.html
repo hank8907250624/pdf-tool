@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF 編輯工作站</title>
+    
+    <!-- 1. 載入 Tailwind CSS (用於樣式) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class', // 支援手動切換深色模式
+        }
+    </script>
+
+    <!-- 2. 載入 Babel Standalone (讓瀏覽器直接編譯 JSX) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- 3. 設定 ES Module Import Map (載入 React 與 Icon 庫) -->
+    <script type="importmap">
+    {
+        "imports": {
+            "react": "https://esm.sh/react@18.2.0",
+            "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+            "lucide-react": "https://esm.sh/lucide-react@0.292.0"
+        }
+    }
+    </script>
+</head>
+<body class="bg-gray-50 dark:bg-[#121212]">
+    <div id="root"></div>
+
+    <!-- 4. 主要應用程式碼 (標記為 text/babel 並使用 module) -->
+    <script type="text/babel" data-type="module">
+        import React, { useState, useEffect, useRef, memo } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import { Upload, Trash2, RotateCw, RotateCcw, FilePlus, Download, Sun, Moon, Undo2, Redo2, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Plus, X, Check, ZoomIn, ZoomOut, Sliders, FolderOpen } from 'lucide-react';
+
+        // --- Global Styles for Custom Scrollbar ---
+        const GlobalStyles = () => (
+            <style>{`
+                .custom-scroll::-webkit-scrollbar { width: 6px; }
+                .custom-scroll::-webkit-scrollbar-track { background: rgba(0,0,0,0.1); border-radius: 8px; }
+                .custom-scroll::-webkit-scrollbar-thumb { background-color: #4b5563; border-radius: 8px; }
+                .custom-scroll::-webkit-scrollbar-thumb:hover { background-color: #6b7280; }
+            `}</style>
+        );
+
+        // --- Utilities ---
+        const generateId = () => Math.random().toString(36).substr(2, 9);
+        const FILE_COLORS = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6'];
+
+        // --- IndexedDB Service ---
+        const DB_NAME = 'PDFWorkspaceDB';
+        const DB_VERSION = 1;
+
+        const openDB = () => new Promise((resolve, reject) => {
+            const request = indexedDB.open(DB_NAME, DB_VERSION);
+            request.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains('files')) db.createObjectStore('files', { keyPath: 'id' });
+                if (!db.objectStoreNames.contains('workspace')) db.createObjectStore('workspace', { keyPath: 'id' });
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+
+        const idbSave = async (storeName, data) => {
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(storeName, 'readwrite');
+                tx.objectStore(storeName).put(data);
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        };
+
+        const idbLoad = async (storeName, id) => {
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(storeName, 'readonly');
+                const req = id ? tx.objectStore(storeName).get(id) : tx.objectStore(storeName).getAll();
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        };
+
+        const idbDelete = async (storeName, id) => {
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(storeName, 'readwrite');
+                const req = tx.objectStore(storeName).delete(id);
+                req.onsuccess = () => resolve();
+                req.onerror = () => reject(req.error);
+            });
+        };
+
+        const idbClear = async (storeName) => {
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(storeName, 'readwrite');
+                const req = tx.objectStore(storeName).clear();
+                req.onsuccess = () => resolve();
+                req.onerror = () => reject(req.error);
+            });
+        };
+
+        // --- Cache for Thumbnails to prevent re-rendering ---
+        const thumbnailCache = new Map();
+
+        // --- Dynamic Script Loader ---
+        const loadScript = (src) => {
+            return new Promise((resolve, reject) => {
+                if (document.querySelector(`script[src="${src}"]`)) {
+                    resolve();
+                    return;
+                }
+                const script = document.createElement('script');
+                script.src = src;
+                script.onload = resolve;
+                script.onerror = reject;
+                document.head.appendChild(script);
+            });
+        };
+
+        // --- Components ---
+
+        // 1. Password Modal
+        const PasswordModal = ({ file, onSubmit, onCancel }) => {
+            const [pwd, setPwd] = useState('');
+            return (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[80]">
+                    <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-xl w-96 max-w-[90vw]">
+                        <h3 className="text-lg font-bold mb-4 text-gray-900 dark:text-white">檔案受密碼保護</h3>
+                        <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">請輸入 {file.name} 的密碼：</p>
+                        <input 
+                            type="password" 
+                            autoFocus 
+                            className="w-full border p-2 rounded mb-4 dark:bg-gray-700 dark:border-gray-600 dark:text-white" 
+                            value={pwd} 
+                            onChange={e => setPwd(e.target.value)} 
+                            onKeyDown={e => e.key === 'Enter' && onSubmit(pwd)} 
+                        />
+                        <div className="flex justify-end space-x-2">
+                            <button onClick={onCancel} className="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded hover:bg-gray-300 dark:hover:bg-gray-600">取消</button>
+                            <button onClick={() => onSubmit(pwd)} className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">確認</button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // 2. Thumbnail Component (Lazy Loaded & Cached)
+        const Thumbnail = memo(({ page, isSelected, onClick, onSelect, onDragStart, onDragOver, onDragEnd, onDrop, originalFile, onRotate, onDelete, dropIndicator, onInsertBlank, isLast, gridScale }) => {
+            const [imgSrc, setImgSrc] = useState(page.isBlank ? null : thumbnailCache.get(`${page.sourceFileId}-${page.sourcePageIndex}`));
+            const containerRef = useRef(null);
+
+            useEffect(() => {
+                if (page.isBlank || imgSrc) return;
+
+                const observer = new IntersectionObserver((entries) => {
+                    if (entries[0].isIntersecting) {
+                        renderPage();
+                        observer.disconnect();
+                    }
+                }, { rootMargin: '100px' });
+
+                if (containerRef.current) observer.observe(containerRef.current);
+                return () => observer.disconnect();
+            }, [page]);
+
+            const renderPage = async () => {
+                try {
+                    const cacheKey = `${page.sourceFileId}-${page.sourcePageIndex}`;
+                    if (thumbnailCache.has(cacheKey)) {
+                        setImgSrc(thumbnailCache.get(cacheKey));
+                        return;
+                    }
+
+                    const fileData = await idbLoad('files', page.sourceFileId);
+                    if (!fileData) return;
+
+                    const pdfjsLib = window.pdfjsLib;
+                    const pdf = await pdfjsLib.getDocument({ data: fileData.data.slice(0), password: fileData.password }).promise;
+                    const pdfPage = await pdf.getPage(page.sourcePageIndex + 1);
+                    const viewport = pdfPage.getViewport({ scale: 0.5 }); 
+                    const canvas = document.createElement('canvas');
+                    canvas.width = viewport.width;
+                    canvas.height = viewport.height;
+                    await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+                    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+                    thumbnailCache.set(cacheKey, dataUrl);
+                    setImgSrc(dataUrl);
+                } catch (e) {
+                    console.error("Thumbnail render error", e);
+                }
+            };
+
+            const cardStyle = {
+                width: `${10 * gridScale}rem`,
+                height: `${14 * gridScale}rem`
+            };
+
+            return (
+                <div className="relative">
+                    {dropIndicator === 'left' && (
+                        <div className="absolute -left-2.5 sm:-left-3.5 top-0 bottom-0 w-1.5 bg-gray-400/60 dark:bg-gray-500/60 rounded-full z-20 pointer-events-none shadow-sm"></div>
+                    )}
+                    {dropIndicator === 'right' && (
+                        <div className="absolute -right-2.5 sm:-right-3.5 top-0 bottom-0 w-1.5 bg-gray-400/60 dark:bg-gray-500/60 rounded-full z-20 pointer-events-none shadow-sm"></div>
+                    )}
+
+                    <div
+                        className="absolute -left-3 sm:-left-4 top-0 bottom-0 w-6 sm:w-8 flex items-center justify-center cursor-pointer group z-10"
+                        onClick={(e) => { e.stopPropagation(); onInsertBlank(page.index); }}
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={(e) => onDrop(e, page.index)}
+                        title="在此插入"
+                    >
+                        <div className="w-1.5 h-full bg-transparent group-hover:bg-blue-500/80 rounded-full transition-all flex items-center justify-center relative">
+                            <div className="absolute opacity-0 group-hover:opacity-100 bg-blue-500 text-white rounded-full p-0.5 shadow-md transform scale-75 group-hover:scale-100 transition-all">
+                                <Plus size={14} strokeWidth={3} />
+                            </div>
+                        </div>
+                    </div>
+
+                    {isLast && (
+                        <div
+                            className="absolute -right-3 sm:-right-4 top-0 bottom-0 w-6 sm:w-8 flex items-center justify-center cursor-pointer group z-10"
+                            onClick={(e) => { e.stopPropagation(); onInsertBlank(page.index + 1); }}
+                            onDragOver={(e) => e.preventDefault()}
+                            onDrop={(e) => onDrop(e, page.index + 1)}
+                            title="在此插入"
+                        >
+                            <div className="w-1.5 h-full bg-transparent group-hover:bg-blue-500/80 rounded-full transition-all flex items-center justify-center relative">
+                                <div className="absolute opacity-0 group-hover:opacity-100 bg-blue-500 text-white rounded-full p-0.5 shadow-md transform scale-75 group-hover:scale-100 transition-all">
+                                    <Plus size={14} strokeWidth={3} />
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    <div 
+                        ref={containerRef}
+                        style={cardStyle}
+                        draggable
+                        onDragStart={(e) => onDragStart(e, page.id)}
+                        onDragOver={(e) => onDragOver(e, page.index)}
+                        onDragEnd={onDragEnd}
+                        onDrop={(e) => onDrop(e)}
+                        className={`group relative bg-white dark:bg-gray-800 rounded-lg shadow cursor-pointer border-2 transition-all select-none flex flex-col items-center justify-center overflow-hidden
+                            ${isSelected ? 'border-blue-500 ring-2 ring-blue-500/50 scale-[0.98]' : 'border-transparent hover:border-gray-300 dark:hover:border-gray-600 hover:shadow-md'}`}
+                    >
+                        <div 
+                            className="absolute top-0 left-0 w-10 h-10 flex items-start justify-start p-2 z-10"
+                            onClick={(e) => { e.stopPropagation(); onSelect(page.id, e.shiftKey); }}
+                        >
+                            <div className={`w-5 h-5 rounded border ${isSelected ? 'bg-blue-500 border-blue-500 text-white' : 'bg-white border-gray-300 dark:bg-gray-700 dark:border-gray-500'} flex items-center justify-center shadow-sm`}>
+                                {isSelected && <Check size={14} strokeWidth={3} />}
+                            </div>
+                        </div>
+
+                        <div 
+                            className="flex-grow w-full flex items-center justify-center p-2"
+                            onClick={(e) => { e.stopPropagation(); onClick(page.id); }}
+                            style={{ transform: `rotate(${page.rotation || 0}deg)`, transition: 'transform 0.2s' }}
+                        >
+                            {page.isBlank ? (
+                                <span className="text-gray-400 font-medium text-sm">空白頁</span>
+                            ) : imgSrc ? (
+                                <img src={imgSrc} alt="page" className="max-w-full max-h-full object-contain pointer-events-none" />
+                            ) : (
+                                <div className="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                            )}
+                        </div>
+
+                        {!page.isBlank && originalFile && (
+                            <div 
+                                className="absolute bottom-0 left-0 right-0 h-1.5 opacity-80" 
+                                style={{ backgroundColor: originalFile.color }}
+                                title={originalFile.name}
+                            ></div>
+                        )}
+                        
+                        <div className="absolute bottom-2 left-2 bg-black/60 text-white text-xs px-1.5 py-0.5 rounded pointer-events-none z-10 shadow-sm">
+                            #{page.index + 1}
+                        </div>
+
+                        <div className="absolute right-1 top-1/2 -translate-y-1/2 flex flex-col space-y-1.5 opacity-0 group-hover:opacity-100 transition-opacity z-20 bg-gray-900/80 p-1.5 rounded-lg shadow-lg backdrop-blur-sm pointer-events-auto">
+                            <button 
+                                onClick={(e) => { e.stopPropagation(); onRotate(page.id, -90); }} 
+                                className="p-1 text-white rounded hover:bg-gray-700 transition-colors" 
+                                title="向左旋轉"
+                            >
+                                <RotateCcw size={15} />
+                            </button>
+                            <button 
+                                onClick={(e) => { e.stopPropagation(); onRotate(page.id, 90); }} 
+                                className="p-1 text-white rounded hover:bg-gray-700 transition-colors" 
+                                title="向右旋轉"
+                            >
+                                <RotateCw size={15} />
+                            </button>
+                            <div className="h-px w-full bg-gray-600 my-1"></div>
+                            <button 
+                                onClick={(e) => { e.stopPropagation(); onDelete(page.id); }} 
+                                className="p-1 text-red-400 rounded hover:bg-red-500 hover:text-white transition-colors" 
+                                title="刪除"
+                            >
+                                <Trash2 size={15} />
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        });
+
+        // 3. Preview Modal
+        const PreviewModal = ({ pages, initialPageId, onClose, onUpdatePages, selectedIds, onSelect, onRotate, onDelete }) => {
+            const [currentPageId, setCurrentPageId] = useState(initialPageId);
+            const [imgSrc, setImgSrc] = useState(null);
+            const [zoom, setZoom] = useState(1);
+            const [pan, setPan] = useState({ x: 0, y: 0 });
+            const [isDragging, setIsDragging] = useState(false);
+            const [dragIndex, setDragIndex] = useState(null);
+            const [dropTargetIndex, setDropTargetIndex] = useState(null);
+            const [sidebarWidth, setSidebarWidth] = useState(256);
+            const [isResizing, setIsResizing] = useState(false);
+
+            const dragStart = useRef({ x: 0, y: 0 });
+            const sidebarRef = useRef(null);
+
+            const currentIndex = pages.findIndex(p => p.id === currentPageId);
+            const currentPage = pages[currentIndex];
+
+            useEffect(() => {
+                if (!isResizing) return;
+                const handleMouseMove = (e) => setSidebarWidth(Math.max(160, Math.min(window.innerWidth / 2, window.innerWidth - e.clientX)));
+                const handleMouseUp = () => setIsResizing(false);
+                window.addEventListener('mousemove', handleMouseMove);
+                window.addEventListener('mouseup', handleMouseUp);
+                return () => { window.removeEventListener('mousemove', handleMouseMove); window.removeEventListener('mouseup', handleMouseUp); };
+            }, [isResizing]);
+
+            const cardHeight = Math.max(120, (sidebarWidth - 32) * 1.4);
+
+            useEffect(() => {
+                let isActive = true;
+                setImgSrc(null); setZoom(1); setPan({ x: 0, y: 0 });
+
+                const renderHighRes = async () => {
+                    if (!currentPage || currentPage.isBlank) return;
+                    try {
+                        const fileData = await idbLoad('files', currentPage.sourceFileId);
+                        const pdfjsLib = window.pdfjsLib;
+                        const pdf = await pdfjsLib.getDocument({ data: fileData.data.slice(0), password: fileData.password }).promise;
+                        const pdfPage = await pdf.getPage(currentPage.sourcePageIndex + 1);
+                        const viewport = pdfPage.getViewport({ scale: 2.5 }); 
+                        const canvas = document.createElement('canvas');
+                        canvas.width = viewport.width;
+                        canvas.height = viewport.height;
+                        await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+                        if (isActive) setImgSrc(canvas.toDataURL('image/jpeg', 0.9));
+                    } catch (e) { console.error("High-res render error", e); }
+                };
+                renderHighRes();
+                return () => { isActive = false; };
+            }, [currentPageId, currentPage]);
+
+            useEffect(() => {
+                if (sidebarRef.current) {
+                    const activeEl = sidebarRef.current.querySelector(`[data-id="${currentPageId}"]`);
+                    if (activeEl) activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            }, [currentPageId]);
+
+            const handleWheel = (e) => { setZoom(z => Math.max(0.2, Math.min(z - e.deltaY * 0.002, 5))); };
+            const handleMouseDown = (e) => { setIsDragging(true); dragStart.current = { x: e.clientX - pan.x, y: e.clientY - pan.y }; };
+            const handleMouseMove = (e) => { if (isDragging) setPan({ x: e.clientX - dragStart.current.x, y: e.clientY - dragStart.current.y }); };
+            const handleMouseUp = () => setIsDragging(false);
+
+            const goPrev = () => { if (currentIndex > 0) setCurrentPageId(pages[currentIndex - 1].id); };
+            const goNext = () => { if (currentIndex < pages.length - 1) setCurrentPageId(pages[currentIndex + 1].id); };
+
+            const handleDragStart = (e, index) => { setDragIndex(index); e.dataTransfer.effectAllowed = 'move'; setTimeout(() => { if (e.target) e.target.style.opacity = '0.4'; }, 0); };
+            const handleDragOver = (e, index) => {
+                e.preventDefault();
+                const rect = e.currentTarget.getBoundingClientRect();
+                const isBottom = e.clientY > rect.top + rect.height / 2;
+                setDropTargetIndex(isBottom ? index + 1 : index);
+            };
+            const handleDragEnd = (e) => { if (e.target) e.target.style.opacity = '1'; setDragIndex(null); setDropTargetIndex(null); };
+
+            const handleDrop = (e) => {
+                e.preventDefault();
+                if (dragIndex === null || dropTargetIndex === null) return;
+                let fromIndex = dragIndex, toIndex = dropTargetIndex;
+                if (fromIndex === toIndex || fromIndex === toIndex - 1) { setDropTargetIndex(null); setDragIndex(null); return; }
+                const newPages = [...pages];
+                const draggedItem = newPages.splice(fromIndex, 1)[0];
+                if (fromIndex < toIndex) toIndex -= 1;
+                newPages.splice(toIndex, 0, draggedItem);
+                onUpdatePages(newPages); setDragIndex(null); setDropTargetIndex(null);
+            };
+
+            const handleDelete = (id) => {
+                onDelete(id);
+                if (id === currentPageId) {
+                    const remaining = pages.filter(p => p.id !== id);
+                    if (remaining.length === 0) onClose();
+                    else {
+                        const idx = pages.findIndex(p => p.id === id);
+                        setCurrentPageId((remaining[idx] || remaining[remaining.length - 1]).id);
+                    }
+                }
+            };
+
+            const handleInsertBlank = (index) => {
+                const newPages = [...pages];
+                newPages.splice(index, 0, { id: generateId(), isBlank: true, rotation: 0 });
+                onUpdatePages(newPages);
+            };
+
+            useEffect(() => {
+                const handleKeyDown = (e) => {
+                    if (e.key === 'ArrowLeft') goPrev();
+                    if (e.key === 'ArrowRight') goNext();
+                    if (e.key === 'Escape') onClose();
+                };
+                window.addEventListener('keydown', handleKeyDown);
+                return () => window.removeEventListener('keydown', handleKeyDown);
+            }, [currentIndex, pages, onClose]);
+
+            if (!currentPage) return null;
+
+            const InsertIndicator = ({ index }) => (
+                <div className="group flex items-center justify-center cursor-pointer py-1 my-0.5 transition-all" onClick={() => handleInsertBlank(index)} title="在此插入空白頁">
+                    <div className="h-1 w-full bg-transparent group-hover:bg-blue-500/80 rounded-full transition-all flex items-center justify-center relative">
+                        <div className="absolute opacity-0 group-hover:opacity-100 bg-blue-500 text-white rounded-full p-0.5 shadow-md transform scale-75 group-hover:scale-100 transition-all">
+                            <Plus size={14} strokeWidth={3} />
+                        </div>
+                    </div>
+                </div>
+            );
+
+            return (
+                <div className="fixed inset-0 bg-black/90 z-[70] flex" onWheel={handleWheel}>
+                    <div className="flex-grow flex flex-col relative overflow-hidden">
+                        <div className="absolute top-4 right-4 z-10 flex items-center space-x-1.5 bg-gray-900/60 p-1.5 rounded-lg backdrop-blur-sm border border-gray-700 shadow-lg">
+                            <button onClick={() => setZoom(z => Math.max(0.2, z - 0.2))} className="bg-gray-800 text-white p-2 rounded hover:bg-gray-700 transition-colors"><ZoomOut size={18} /></button>
+                            <button onClick={() => setZoom(z => Math.min(5, z + 0.2))} className="bg-gray-800 text-white p-2 rounded hover:bg-gray-700 transition-colors"><ZoomIn size={18} /></button>
+                            <button onClick={() => { setZoom(1); setPan({x:0, y:0}); }} className="bg-gray-800 text-white px-3 py-2 rounded hover:bg-gray-700 text-sm font-medium transition-colors">重設</button>
+                            <div className="w-px h-6 bg-gray-600 mx-1"></div>
+                            <button onClick={onClose} className="bg-gray-800 text-red-400 p-2 rounded hover:bg-red-600 hover:text-white transition-colors"><X size={18} /></button>
+                        </div>
+
+                        <div 
+                            className="flex-grow flex items-center justify-center cursor-grab active:cursor-grabbing overflow-hidden"
+                            onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
+                        >
+                            <div style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${currentPage.rotation || 0}deg)`, transition: isDragging ? 'none' : 'transform 0.1s' }}>
+                                {currentPage.isBlank ? (
+                                    <div className="w-96 h-[500px] bg-white flex items-center justify-center shadow-2xl"><span className="text-2xl text-gray-400">空白頁</span></div>
+                                ) : imgSrc ? (
+                                    <img src={imgSrc} alt="Preview" className="max-w-none max-h-[90vh] object-contain shadow-2xl bg-white" draggable="false" />
+                                ) : (
+                                    <div className="text-white flex flex-col items-center">
+                                        <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+                                        載入高畫質預覽...
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style={{ width: `${sidebarWidth}px` }} className="relative flex-shrink-0 bg-gray-900 flex flex-col border-l border-gray-700 shadow-xl z-20" onWheel={(e) => e.stopPropagation()}>
+                        <div className="absolute left-0 top-0 bottom-0 w-2 cursor-col-resize hover:bg-blue-500/50 z-30 transition-colors -translate-x-1/2" onMouseDown={(e) => { e.preventDefault(); setIsResizing(true); }} />
+                        <button onClick={goPrev} disabled={currentIndex === 0} className="py-2 text-gray-400 hover:text-white hover:bg-gray-800 disabled:opacity-30 flex justify-center transition-colors border-b border-gray-800 z-10 shadow-sm"><ChevronUp size={24} /></button>
+                        <div className="flex-grow overflow-y-auto px-3 py-2 custom-scroll" ref={sidebarRef}>
+                            <InsertIndicator index={0} />
+                            {pages.map((p, idx) => {
+                                let dropIndicator = null;
+                                if (dropTargetIndex === idx) dropIndicator = 'top';
+                                else if (dropTargetIndex === pages.length && idx === pages.length - 1) dropIndicator = 'bottom';
+                                return (
+                                    <React.Fragment key={p.id}>
+                                        <div className="relative">
+                                            {dropIndicator === 'top' && <div className="absolute -top-1 left-0 right-0 h-1 bg-gray-400/80 rounded-full z-20 pointer-events-none shadow-sm"></div>}
+                                            {dropIndicator === 'bottom' && <div className="absolute -bottom-1 left-0 right-0 h-1 bg-gray-400/80 rounded-full z-20 pointer-events-none shadow-sm"></div>}
+                                            <div 
+                                                draggable onDragStart={(e) => handleDragStart(e, idx)} onDragOver={(e) => handleDragOver(e, idx)} onDragEnd={handleDragEnd} onDrop={handleDrop}
+                                                data-id={p.id} onClick={() => setCurrentPageId(p.id)} style={{ height: `${cardHeight}px` }}
+                                                className={`group relative bg-gray-800 rounded-lg cursor-pointer border-2 flex flex-col items-center justify-between p-2 transition-all shadow-md ${p.id === currentPageId ? 'border-blue-500 ring-2 ring-blue-500/30' : 'border-transparent hover:border-gray-600'}`}
+                                            >
+                                                <div className="w-full flex justify-between items-start z-10">
+                                                    <div className="bg-black/60 text-white text-xs px-1.5 py-0.5 rounded pointer-events-none">#{p.index + 1}</div>
+                                                    <div className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${selectedIds.has(p.id) ? 'bg-blue-500 border-blue-500 text-white' : 'bg-gray-700/80 border-gray-500 hover:border-gray-400'}`} onClick={(e) => { e.stopPropagation(); onSelect(p.id, e.shiftKey); }}>
+                                                        {selectedIds.has(p.id) && <Check size={14} strokeWidth={3} />}
+                                                    </div>
+                                                </div>
+                                                <div className="flex-grow w-full flex items-center justify-center overflow-hidden py-1">
+                                                    {p.isBlank ? <span className="text-gray-500 text-xs">空白頁</span> : <img src={thumbnailCache.get(`${p.sourceFileId}-${p.sourcePageIndex}`)} alt="thumb" className="max-h-full max-w-full object-contain pointer-events-none" style={{transform: `rotate(${p.rotation||0}deg)`}} />}
+                                                </div>
+                                                <div className="absolute right-1 top-1/2 -translate-y-1/2 flex flex-col space-y-1.5 opacity-0 group-hover:opacity-100 transition-opacity z-20 bg-gray-900/80 p-1.5 rounded-lg shadow-lg backdrop-blur-sm pointer-events-auto">
+                                                    <button onClick={(e) => { e.stopPropagation(); onRotate(p.id, -90); }} className="p-1 text-white rounded hover:bg-gray-700 transition-colors"><RotateCcw size={15} /></button>
+                                                    <button onClick={(e) => { e.stopPropagation(); onRotate(p.id, 90); }} className="p-1 text-white rounded hover:bg-gray-700 transition-colors"><RotateCw size={15} /></button>
+                                                    <div className="h-px w-full bg-gray-600 my-1"></div>
+                                                    <button onClick={(e) => { e.stopPropagation(); handleDelete(p.id); }} className="p-1 text-red-400 rounded hover:bg-red-500 hover:text-white transition-colors"><Trash2 size={15} /></button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <InsertIndicator index={idx + 1} />
+                                    </React.Fragment>
+                                );
+                            })}
+                        </div>
+                        <button onClick={goNext} disabled={currentIndex === pages.length - 1} className="py-2 text-gray-400 hover:text-white hover:bg-gray-800 disabled:opacity-30 flex justify-center transition-colors border-t border-gray-800 z-10 shadow-[0_-2px_10px_rgba(0,0,0,0.2)]"><ChevronDown size={24} /></button>
+                    </div>
+                </div>
+            );
+        };
+
+        // 4. File Manager Modal
+        const FileManagerModal = ({ files, pages, onClose, onSelectFilePages, onRemoveFile }) => (
+            <div className="fixed inset-0 bg-black/50 z-[80] flex items-center justify-center">
+                <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-[500px] max-w-[90vw] max-h-[80vh] flex flex-col">
+                    <div className="flex justify-between items-center p-4 border-b dark:border-gray-700">
+                        <h2 className="text-lg font-bold flex items-center gap-2 dark:text-white"><FolderOpen size={20}/> 來源檔案管理</h2>
+                        <button onClick={onClose} className="text-gray-500 hover:text-gray-800 dark:hover:text-white"><X size={20}/></button>
+                    </div>
+                    <div className="overflow-y-auto p-4 flex-grow space-y-3 custom-scroll">
+                        {Object.values(files).length === 0 ? (
+                            <p className="text-center text-gray-500 my-4">目前沒有已載入的檔案。</p>
+                        ) : Object.values(files).map(f => {
+                            const pageCount = pages.filter(p => p.sourceFileId === f.id).length;
+                            return (
+                                <div key={f.id} className="flex justify-between items-center bg-gray-50 dark:bg-gray-700/50 p-3 rounded-lg border border-gray-200 dark:border-gray-600">
+                                    <div className="flex flex-col overflow-hidden">
+                                        <div className="flex items-center space-x-2">
+                                            <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: f.color }}></div>
+                                            <span className="font-medium text-sm truncate dark:text-gray-200" title={f.name}>{f.name}</span>
+                                        </div>
+                                        <span className="text-xs text-gray-500 dark:text-gray-400 ml-5 mt-1">殘留 {pageCount} 頁於工作區</span>
+                                    </div>
+                                    <div className="flex space-x-2 flex-shrink-0 ml-2">
+                                        <button onClick={() => onSelectFilePages(f.id)} className="px-3 py-1.5 text-xs bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/40 dark:text-blue-300 dark:hover:bg-blue-800/60 rounded transition-colors">全選頁面</button>
+                                        <button onClick={() => onRemoveFile(f.id)} className="px-3 py-1.5 text-xs bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/40 dark:text-red-300 dark:hover:bg-red-800/60 rounded transition-colors">移除檔案</button>
+                                    </div>
+                                </div>
+                            )
+                        })}
+                    </div>
+                </div>
+            </div>
+        );
+
+        // --- Main App Component ---
+        function App() {
+            const [isReady, setIsReady] = useState(false);
+            const [files, setFiles] = useState({}); 
+            const [pages, setPages] = useState([]); 
+            const [selectedIds, setSelectedIds] = useState(new Set());
+            const [lastSelectedId, setLastSelectedId] = useState(null);
+            const [history, setHistory] = useState([]);
+            const [historyIndex, setHistoryIndex] = useState(-1);
+            const [pwdPrompt, setPwdPrompt] = useState(null);
+            const [previewModal, setPreviewModal] = useState(null);
+            const [showFileManager, setShowFileManager] = useState(false);
+            const [showExportMenu, setShowExportMenu] = useState(false); 
+            const [showDeleteMenu, setShowDeleteMenu] = useState(false);
+            const [darkMode, setDarkMode] = useState(true);
+            const [gridScale, setGridScale] = useState(1);
+            const [isExporting, setIsExporting] = useState(false);
+            const [exportProgress, setExportProgress] = useState(null);
+            const [dialog, setDialog] = useState(null); 
+            const [toast, setToast] = useState(""); 
+            const fileInputRef = useRef(null);
+            const dragItem = useRef();
+            const [dropTargetIndex, setDropTargetIndex] = useState(null);
+
+            useEffect(() => {
+                if (toast) {
+                    const timer = setTimeout(() => setToast(""), 3000);
+                    return () => clearTimeout(timer);
+                }
+            }, [toast]);
+
+            useEffect(() => {
+                const setup = async () => {
+                    try {
+                        await Promise.all([
+                            loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'),
+                            loadScript('https://unpkg.com/pdf-lib/dist/pdf-lib.min.js')
+                        ]);
+                        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                        setIsReady(true);
+                        const ws = await idbLoad('workspace', 'current');
+                        if (ws) {
+                            setFiles(ws.files || {});
+                            setPages(ws.pages || []);
+                            pushHistory(ws.pages || [], true);
+                        }
+                    } catch (e) { console.error("Initialization failed", e); }
+                };
+                setup();
+            }, []);
+
+            useEffect(() => {
+                if (pages.length > 0) {
+                    const timer = setTimeout(() => { idbSave('workspace', { id: 'current', files, pages }); }, 1000);
+                    return () => clearTimeout(timer);
+                }
+            }, [pages, files]);
+
+            useEffect(() => {
+                if (darkMode) document.documentElement.classList.add('dark');
+                else document.documentElement.classList.remove('dark');
+            }, [darkMode]);
+
+            const pushHistory = (newPages, replace = false) => {
+                const newHistory = replace ? [newPages] : [...history.slice(0, historyIndex + 1), newPages];
+                if (newHistory.length > 20) newHistory.shift();
+                setHistory(newHistory);
+                setHistoryIndex(newHistory.length - 1);
+            };
+
+            const updatePages = (newPages) => { setPages(newPages); pushHistory(newPages); };
+            const undo = () => { if (historyIndex > 0) { const newIndex = historyIndex - 1; setHistoryIndex(newIndex); setPages(history[newIndex]); setSelectedIds(new Set()); } };
+            const redo = () => { if (historyIndex < history.length - 1) { const newIndex = historyIndex + 1; setHistoryIndex(newIndex); setPages(history[newIndex]); setSelectedIds(new Set()); } };
+
+            const rotateSingle = (id, deg = 90) => { updatePages(pages.map(p => p.id === id ? { ...p, rotation: (p.rotation + deg) % 360 } : p)); };
+            const deleteSingle = (id) => {
+                updatePages(pages.filter(p => p.id !== id));
+                setSelectedIds(prev => { const next = new Set(prev); next.delete(id); return next; });
+            };
+
+            useEffect(() => {
+                const handleKeyDown = (e) => {
+                    if (previewModal || pwdPrompt || showFileManager) return; 
+                    if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
+                    if ((e.ctrlKey || e.metaKey) && e.key === 'y') { e.preventDefault(); redo(); }
+                    if ((e.ctrlKey || e.metaKey) && e.key === 'a') { e.preventDefault(); selectAll(); }
+                    if (e.key === 'Delete' || e.key === 'Backspace') { if (selectedIds.size > 0) handleDeleteSelected(); }
+                };
+                window.addEventListener('keydown', handleKeyDown);
+                return () => window.removeEventListener('keydown', handleKeyDown);
+            }, [historyIndex, history, selectedIds, previewModal, pwdPrompt, showFileManager]);
+
+            const handleFileUpload = async (e, insertIndex = -1) => {
+                const newFiles = Array.from(e.target.files || e.dataTransfer.files);
+                if (!newFiles.length) return;
+                let currentPages = [...pages], currentFiles = { ...files };
+                const pdfjsLib = window.pdfjsLib;
+                const pagesToAdd = [];
+
+                for (const file of newFiles) {
+                    const fileId = generateId();
+                    const color = FILE_COLORS[Object.keys(currentFiles).length % FILE_COLORS.length];
+                    const arrayBuffer = await file.arrayBuffer();
+                    let pdfDoc, password = '';
+                    
+                    try { pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise; }
+                    catch (err) {
+                        if (err.name === 'PasswordException') {
+                            password = await new Promise((resolve, reject) => { setPwdPrompt({ file, resolve, reject }); });
+                            setPwdPrompt(null);
+                            if (!password) continue; 
+                            try { pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0), password }).promise; }
+                            catch (pwdErr) { setToast("密碼錯誤，跳過此檔案。"); continue; }
+                        } else { console.error(err); setToast(`讀取 ${file.name} 失敗`); continue; }
+                    }
+
+                    const numPages = pdfDoc.numPages;
+                    await idbSave('files', { id: fileId, data: arrayBuffer, password });
+                    currentFiles[fileId] = { id: fileId, name: file.name, color };
+                    for (let i = 0; i < numPages; i++) {
+                        pagesToAdd.push({ id: generateId(), sourceFileId: fileId, sourcePageIndex: i, rotation: 0, isBlank: false });
+                    }
+                }
+                
+                setFiles(currentFiles);
+                if (insertIndex >= 0 && insertIndex <= currentPages.length) currentPages.splice(insertIndex, 0, ...pagesToAdd);
+                else currentPages = currentPages.concat(pagesToAdd);
+
+                updatePages(currentPages);
+                if (fileInputRef.current) fileInputRef.current.value = '';
+            };
+
+            const addBlankPage = () => {
+                const newPage = { id: generateId(), isBlank: true, rotation: 0 };
+                const newPages = [...pages];
+                if (selectedIds.size > 0) {
+                    const lastIdx = pages.findIndex(p => p.id === Array.from(selectedIds).pop());
+                    newPages.splice(lastIdx + 1, 0, newPage);
+                } else newPages.push(newPage);
+                updatePages(newPages);
+            };
+
+            const handleInsertBlank = (index) => {
+                const newPages = [...pages];
+                newPages.splice(index, 0, { id: generateId(), isBlank: true, rotation: 0 });
+                updatePages(newPages);
+            };
+
+            const handleSelect = (id, shiftKey) => {
+                setLastSelectedId(id);
+                const newSet = new Set(selectedIds);
+                if (shiftKey && lastSelectedId) {
+                    const idx1 = pages.findIndex(p => p.id === lastSelectedId);
+                    const idx2 = pages.findIndex(p => p.id === id);
+                    const start = Math.min(idx1, idx2), end = Math.max(idx1, idx2);
+                    for (let i = start; i <= end; i++) newSet.add(pages[i].id);
+                } else if (newSet.has(id)) newSet.delete(id);
+                else newSet.add(id);
+                setSelectedIds(newSet);
+            };
+
+            const selectAll = () => {
+                if (selectedIds.size === pages.length) setSelectedIds(new Set());
+                else setSelectedIds(new Set(pages.map(p => p.id)));
+            };
+
+            const rotateSelected = (dir = 90) => {
+                if (selectedIds.size === 0) return;
+                updatePages(pages.map(p => selectedIds.has(p.id) ? { ...p, rotation: (p.rotation + dir) % 360 } : p));
+            };
+
+            const handleDeleteSelected = () => {
+                updatePages(pages.filter(p => !selectedIds.has(p.id)));
+                setSelectedIds(new Set());
+            };
+
+            const selectAllOfFile = (fileId) => {
+                const filePageIds = pages.filter(p => p.sourceFileId === fileId).map(p => p.id);
+                setSelectedIds(new Set([...selectedIds, ...filePageIds]));
+                setShowFileManager(false);
+                setToast("已選取該檔案所有頁面");
+            };
+
+            const removeFile = async (fileId) => {
+                updatePages(pages.filter(p => p.sourceFileId !== fileId));
+                const newFiles = { ...files }; delete newFiles[fileId]; setFiles(newFiles);
+                const newSelected = new Set(selectedIds);
+                pages.forEach(p => { if (p.sourceFileId === fileId) newSelected.delete(p.id); });
+                setSelectedIds(newSelected);
+                try { await idbDelete('files', fileId); } catch(e){}
+            };
+
+            const onDragStart = (e, id) => { dragItem.current = pages.findIndex(p => p.id === id); e.dataTransfer.effectAllowed = 'move'; setTimeout(() => { if(e.target) e.target.style.opacity = '0.4'; }, 0); };
+            const handleDragOver = (e, index) => {
+                e.preventDefault(); 
+                const rect = e.currentTarget.getBoundingClientRect();
+                const isRight = e.clientX > rect.left + rect.width / 2;
+                setDropTargetIndex(isRight ? index + 1 : index);
+            };
+            const onDragEnd = (e) => { if(e.target) e.target.style.opacity = '1'; dragItem.current = null; setDropTargetIndex(null); };
+
+            const onDrop = (e, explicitIndex = null) => {
+                e.preventDefault();
+                let toIndex = explicitIndex !== null ? explicitIndex : dropTargetIndex;
+                if (toIndex === null) toIndex = pages.length;
+
+                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                    handleFileUpload(e, toIndex);
+                    setDropTargetIndex(null);
+                    return;
+                }
+
+                if (dragItem.current === null) return;
+                const fromIndex = dragItem.current;
+                const draggedPageId = pages[fromIndex].id;
+                const isMulti = selectedIds.has(draggedPageId) && selectedIds.size > 1;
+                const itemsToMoveIds = isMulti ? Array.from(selectedIds) : [draggedPageId];
+
+                const newPages = [...pages];
+                const itemsToMove = newPages.filter(p => itemsToMoveIds.includes(p.id));
+                const remainingPages = newPages.filter(p => !itemsToMoveIds.includes(p.id));
+
+                const removedBeforeTarget = newPages.slice(0, toIndex).filter(p => itemsToMoveIds.includes(p.id)).length;
+                const finalTargetIndex = toIndex - removedBeforeTarget;
+
+                remainingPages.splice(finalTargetIndex, 0, ...itemsToMove);
+                dragItem.current = null;
+                setDropTargetIndex(null);
+                updatePages(remainingPages);
+            };
+
+            const handleGlobalDrop = (e) => {
+                e.preventDefault();
+                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) handleFileUpload(e, pages.length);
+            };
+
+            const requestClearAll = () => {
+                setDialog({
+                    title: "清空工作區", message: "確定要清除所有頁面與檔案嗎？此動作無法復原。",
+                    confirmText: "確定清空", cancelText: "取消",
+                    onConfirm: async () => {
+                        setPages([]); setFiles({}); setSelectedIds(new Set()); setHistory([]); setHistoryIndex(-1); thumbnailCache.clear();
+                        try { await idbClear('files'); await idbClear('workspace'); } catch (e) { console.error("清除資料庫失敗", e); }
+                        setDialog(null);
+                    },
+                    onCancel: () => setDialog(null)
+                });
+            };
+
+            const handleExport = async (exportSelectedOnly = false) => {
+                const pagesToExport = exportSelectedOnly ? pages.filter(p => selectedIds.has(p.id)) : pages;
+                if (pagesToExport.length === 0) return;
+                setIsExporting(true); setExportProgress(0);
+
+                try {
+                    const requiredFileIds = new Set(pagesToExport.filter(p => !p.isBlank).map(p => p.sourceFileId));
+                    const fileBuffers = {};
+                    for (const fileId of requiredFileIds) {
+                        const fileData = await idbLoad('files', fileId);
+                        if (fileData) fileBuffers[fileId] = fileData.data; 
+                    }
+
+                    const workerCode = `
+                        importScripts('https://unpkg.com/pdf-lib/dist/pdf-lib.min.js');
+                        self.onmessage = async (e) => {
+                            try {
+                                const { pagesToProcess, fileBuffers } = e.data;
+                                const { PDFDocument, degrees } = self.PDFLib;
+                                const finalDoc = await PDFDocument.create();
+                                const sourceDocs = {};
+
+                                for (let i = 0; i < pagesToProcess.length; i++) {
+                                    const page = pagesToProcess[i];
+                                    self.postMessage({ type: 'progress', percent: Math.round(((i + 1) / pagesToProcess.length) * 90) });
+
+                                    if (page.isBlank) {
+                                        finalDoc.addPage([595.28, 841.89]); 
+                                    } else {
+                                        if (!sourceDocs[page.sourceFileId]) {
+                                            const buf = fileBuffers[page.sourceFileId].slice(0);
+                                            sourceDocs[page.sourceFileId] = await PDFDocument.load(buf, { ignoreEncryption: true });
+                                        }
+                                        const [copiedPage] = await finalDoc.copyPages(sourceDocs[page.sourceFileId], [page.sourcePageIndex]);
+                                        if (page.rotation) {
+                                            const currentAngle = copiedPage.getRotation().angle;
+                                            copiedPage.setRotation(degrees(currentAngle + page.rotation));
+                                        }
+                                        finalDoc.addPage(copiedPage);
+                                    }
+                                }
+                                
+                                self.postMessage({ type: 'progress', percent: 95 });
+                                const pdfBytes = await finalDoc.save({ useObjectStreams: true });
+                                self.postMessage({ type: 'done', data: pdfBytes });
+                            } catch (err) {
+                                self.postMessage({ type: 'error', error: err.message });
+                            }
+                        };
+                    `;
+
+                    const blob = new Blob([workerCode], { type: 'application/javascript' });
+                    const workerUrl = URL.createObjectURL(blob);
+                    const worker = new Worker(workerUrl);
+
+                    worker.onmessage = (e) => {
+                        if (e.data.type === 'progress') {
+                            setExportProgress(e.data.percent);
+                        } else if (e.data.type === 'done') {
+                            const resultBlob = new Blob([e.data.data], { type: 'application/pdf' });
+                            const url = URL.createObjectURL(resultBlob);
+                            const link = document.createElement('a');
+                            link.href = url;
+                            link.download = `merged_document_${new Date().getTime()}.pdf`;
+                            document.body.appendChild(link);
+                            link.click();
+                            document.body.removeChild(link);
+                            URL.revokeObjectURL(url);
+                            
+                            setIsExporting(false); setExportProgress(null); worker.terminate(); URL.revokeObjectURL(workerUrl);
+                            setToast("✅ 匯出成功！");
+                        } else if (e.data.type === 'error') {
+                            console.error("Worker error:", e.data.error);
+                            setToast("匯出失敗: " + e.data.error);
+                            setIsExporting(false); setExportProgress(null); worker.terminate(); URL.revokeObjectURL(workerUrl);
+                        }
+                    };
+
+                    worker.postMessage({ pagesToProcess: pagesToExport, fileBuffers });
+
+                } catch (e) {
+                    console.error(e);
+                    setToast("匯出處理發生錯誤");
+                    setIsExporting(false); setExportProgress(null);
+                }
+            };
+
+            if (!isReady) {
+                return (
+                    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 dark:bg-[#121212] text-gray-800 dark:text-gray-200">
+                        <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+                        <p>載入 PDF 處理核心中...</p>
+                    </div>
+                );
+            }
+
+            const displayPages = pages.map((p, i) => ({ ...p, index: i }));
+
+            return (
+                <div className={`flex flex-col h-screen overflow-x-auto ${darkMode ? 'dark bg-[#121212] text-gray-100' : 'bg-gray-50 text-gray-900'}`} onDragOver={(e) => e.preventDefault()} onDrop={handleGlobalDrop}>
+                    <GlobalStyles />
+                    <div className="bg-white dark:bg-[#1e1e1e] border-b dark:border-gray-800 px-4 py-2.5 shadow-sm z-50 flex flex-nowrap items-center justify-between gap-4 min-w-max">
+                        <div className="flex items-center space-x-3 flex-shrink-0">
+                            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-500 to-blue-400">PDF 編輯工作站</h1>
+                            <div className="h-6 w-px bg-gray-300 dark:bg-gray-700"></div>
+                            <input type="file" ref={fileInputRef} onChange={handleFileUpload} multiple accept="application/pdf" className="hidden" />
+                            <button onClick={() => fileInputRef.current.click()} className="flex items-center space-x-1 px-3 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 transition shadow-sm">
+                                <Upload size={18} /> <span className="text-sm font-medium">加入檔案</span>
+                            </button>
+                        </div>
+
+                        <div className="flex items-center space-x-2 bg-gray-50 dark:bg-gray-800/50 px-3 py-1.5 rounded-lg border dark:border-gray-700 flex-shrink-0">
+                            <div className="flex items-center space-x-2 mr-1" title="調整網格大小">
+                                <Sliders size={16} className="text-gray-500"/>
+                                <input type="range" min="0.6" max="1.5" step="0.1" value={gridScale} onChange={(e) => setGridScale(parseFloat(e.target.value))} className="w-20 accent-blue-500" />
+                            </div>
+                            <div className="h-6 w-px bg-gray-300 dark:bg-gray-700 mr-1"></div>
+                            <div className="w-[72px] flex justify-center flex-shrink-0">
+                                <span className={`text-sm font-medium transition-opacity duration-200 ${selectedIds.size > 0 ? 'text-blue-500 opacity-100' : 'opacity-0 select-none pointer-events-none'}`}>
+                                    選取 {selectedIds.size} 頁
+                                </span>
+                            </div>
+                            <button onClick={selectAll} className="p-1.5 text-sm font-medium rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 transition" title="全選">全選</button>
+                            <button onClick={() => setSelectedIds(new Set())} disabled={selectedIds.size === 0} className="p-1.5 text-sm font-medium rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 transition" title="取消全選">取消</button>
+                            <div className="h-6 w-px bg-gray-300 dark:bg-gray-700 mx-1"></div>
+                            <button onClick={undo} disabled={historyIndex <= 0} className="p-1.5 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 transition" title="復原 (Ctrl+Z)"><Undo2 size={18} /></button>
+                            <button onClick={redo} disabled={historyIndex >= history.length - 1} className="p-1.5 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 transition" title="重做 (Ctrl+Y / Ctrl+Shift+Z)"><Redo2 size={18} /></button>
+                            <div className="h-6 w-px bg-gray-300 dark:bg-gray-700 mx-1"></div>
+                            <button onClick={() => rotateSelected(90)} disabled={selectedIds.size === 0} className="p-1.5 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 transition" title="選取向右旋轉"><RotateCw size={18} /></button>
+                            <div className="relative flex items-center">
+                                <button onClick={handleDeleteSelected} disabled={selectedIds.size === 0} className="p-1.5 text-red-500 rounded-l-md hover:bg-red-50 dark:hover:bg-red-900/30 disabled:opacity-50 transition" title="刪除選取 (Del)"><Trash2 size={18} /></button>
+                                <button onClick={() => setShowDeleteMenu(!showDeleteMenu)} onBlur={() => setTimeout(() => setShowDeleteMenu(false), 200)} disabled={pages.length === 0} className="px-1 py-1.5 text-red-500 rounded-r-md hover:bg-red-50 dark:hover:bg-red-900/30 disabled:opacity-50 transition flex items-center justify-center border-l border-red-200 dark:border-red-900/50"><ChevronDown size={14} /></button>
+                                {showDeleteMenu && (
+                                    <div className="absolute left-0 top-full mt-1 w-24 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg z-[100] overflow-hidden py-1">
+                                        <button onMouseDown={(e) => { e.preventDefault(); requestClearAll(); setShowDeleteMenu(false); }} className="w-full text-left px-4 py-2 text-sm font-medium text-red-500 hover:bg-red-50 dark:hover:bg-gray-700 transition-colors">清空</button>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="h-6 w-px bg-gray-300 dark:bg-gray-700 mx-1"></div>
+                            <button onClick={addBlankPage} title="加空白頁" className="flex items-center justify-center p-1.5 text-gray-700 dark:text-gray-200 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 transition"><FilePlus size={18} /></button>
+                            <button onClick={() => setShowFileManager(true)} title="檔案管理" className="flex items-center justify-center p-1.5 text-gray-700 dark:text-gray-200 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 transition"><FolderOpen size={18} /></button>
+                        </div>
+
+                        <div className="flex items-center space-x-3 flex-shrink-0">
+                            <button onClick={() => setDarkMode(!darkMode)} className="p-2 rounded-md text-gray-500 hover:bg-gray-200 dark:hover:bg-gray-800 transition">{darkMode ? <Sun size={20} /> : <Moon size={20} />}</button>
+                            <div className="relative flex shadow-sm rounded-md">
+                                <button onClick={() => handleExport(false)} disabled={pages.length === 0 || isExporting} className="flex items-center space-x-1 px-4 py-2 bg-green-600 text-white rounded-l-md hover:bg-green-700 transition disabled:opacity-50">
+                                    {isExporting ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : <Download size={18} />}
+                                    <span className="text-sm font-medium">{isExporting ? `匯出 (${exportProgress}%)` : '匯出全部'}</span>
+                                </button>
+                                <button onClick={() => setShowExportMenu(!showExportMenu)} onBlur={() => setTimeout(() => setShowExportMenu(false), 200)} disabled={pages.length === 0 || isExporting} className="px-2 py-2 bg-green-700 text-white rounded-r-md hover:bg-green-800 transition disabled:opacity-50 border-l border-green-800/50 flex items-center justify-center"><ChevronDown size={16} /></button>
+                                {showExportMenu && (
+                                    <div className="absolute right-0 top-full mt-1 w-36 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg z-[100] overflow-hidden py-1">
+                                        <button onMouseDown={(e) => { e.preventDefault(); handleExport(true); setShowExportMenu(false); }} disabled={selectedIds.size === 0} className="w-full text-left px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">匯出選取 ({selectedIds.size})</button>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {isExporting && exportProgress !== null && (
+                        <div className="absolute top-0 left-0 w-full h-1 bg-gray-200 z-50">
+                            <div className="h-full bg-green-500 transition-all duration-300" style={{ width: `${exportProgress}%` }}></div>
+                        </div>
+                    )}
+
+                    <div className="flex-grow overflow-y-auto p-6 bg-gray-100 dark:bg-black/20">
+                        {pages.length === 0 ? (
+                            <div className="h-full flex flex-col items-center justify-center text-gray-400 dark:text-gray-500 border-4 border-dashed border-gray-300 dark:border-gray-700 rounded-2xl m-8">
+                                <Upload size={48} className="mb-4 opacity-50" />
+                                <p className="text-lg font-medium">拖曳檔案至此，或點擊「加入檔案」開始編輯</p>
+                                <p className="text-sm mt-2 opacity-70">支援自動存檔、Shift多選、多選拖曳排序</p>
+                            </div>
+                        ) : (
+                            <div className="flex flex-wrap gap-4 sm:gap-6 justify-center sm:justify-start pb-20 items-center">
+                                {displayPages.map((page) => {
+                                    let dropIndicator = null;
+                                    if (dropTargetIndex === page.index) dropIndicator = 'left';
+                                    else if (dropTargetIndex === pages.length && page.index === pages.length - 1) dropIndicator = 'right';
+
+                                    return (
+                                        <Thumbnail 
+                                            key={page.id} page={page} originalFile={files[page.sourceFileId]} isSelected={selectedIds.has(page.id)}
+                                            onClick={setPreviewModal} onSelect={handleSelect} onDragStart={onDragStart} onDragOver={(e) => handleDragOver(e, page.index)}
+                                            onDragEnd={onDragEnd} onDrop={onDrop} onRotate={rotateSingle} onDelete={deleteSingle}
+                                            dropIndicator={dropIndicator} onInsertBlank={handleInsertBlank} isLast={page.index === pages.length - 1} gridScale={gridScale}
+                                        />
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </div>
+
+                    {pwdPrompt && <PasswordModal file={pwdPrompt.file} onSubmit={(pwd) => pwdPrompt.resolve(pwd)} onCancel={() => pwdPrompt.resolve(null)} />}
+                    {showFileManager && <FileManagerModal files={files} pages={pages} onClose={() => setShowFileManager(false)} onSelectFilePages={selectAllOfFile} onRemoveFile={removeFile} />}
+                    {previewModal && <PreviewModal pages={displayPages} initialPageId={previewModal} onClose={() => setPreviewModal(null)} onUpdatePages={updatePages} selectedIds={selectedIds} onSelect={handleSelect} onRotate={rotateSingle} onDelete={deleteSingle} />}
+                    
+                    {dialog && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[90]">
+                            <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-xl w-96 max-w-[90vw]">
+                                <h3 className="text-lg font-bold mb-4 text-gray-900 dark:text-white">{dialog.title}</h3>
+                                <p className="text-sm text-gray-600 dark:text-gray-300 mb-6">{dialog.message}</p>
+                                <div className="flex justify-end space-x-2">
+                                    {dialog.onCancel && <button onClick={dialog.onCancel} className="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors">{dialog.cancelText || '取消'}</button>}
+                                    <button onClick={dialog.onConfirm} className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors">{dialog.confirmText || '確認'}</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {toast && (
+                        <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 bg-gray-900 text-white px-4 py-3 rounded-lg shadow-xl z-[100] flex items-center space-x-3 transition-all">
+                            <span className="text-sm font-medium">{toast}</span>
+                            <button onClick={() => setToast("")} className="text-gray-400 hover:text-white transition-colors"><X size={16} /></button>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // 啟動 React 應用
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
